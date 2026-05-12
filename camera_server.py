@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
 reCamera API Server
-Simple HTTP API for video capture and metadata storage.
+Simple HTTP server for video capture and metadata storage.
 Listens on port 8080 and provides endpoints for crash event video capture.
+Automatically uploads video metadata to the forklift crash detector server.
 """
 
 import os
 import json
 import threading
 import time
+import urllib.request
+import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
@@ -17,7 +20,7 @@ from datetime import datetime
 API_PORT = 8080
 VIDEO_DIR = "/tmp/sd/videos"
 METADATA_DIR = "/tmp/sd/metadata"
-BUFFER_DURATION = 300  # Keep 5 min rolling buffer (in seconds)
+SERVER_URL = "http://10.35.2.216:8000"  # Forklift crash detector server
 
 # Ensure directories exist
 os.makedirs(VIDEO_DIR, exist_ok=True)
@@ -40,6 +43,80 @@ class VideoBuffer:
 
 video_buffer = VideoBuffer()
 
+def upload_video_metadata(event_id, filename, filepath):
+    """Upload video metadata to crash detector server"""
+    try:
+        # Get file size
+        file_size = os.path.getsize(filepath)
+
+        # Build video URL
+        video_url = f"http://172.24.30.125:8080/videos/{filename}"
+
+        # Prepare metadata
+        metadata = {
+            "video_url": video_url,
+            "video_filename": filename,
+            "video_size": file_size
+        }
+
+        # Send to server
+        url = f"{SERVER_URL}/api/events/{event_id}/video"
+        data = json.dumps(metadata).encode('utf-8')
+
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            log_msg = f"[{datetime.now().isoformat()}] ✓ Video uploaded to server: {filename} ({file_size / (1024*1024):.1f} MB)"
+            print(log_msg)
+            return True
+
+    except urllib.error.HTTPError as e:
+        log_msg = f"[{datetime.now().isoformat()}] ✗ Server error uploading video: HTTP {e.code} - {e.reason}"
+        print(log_msg)
+        return False
+    except Exception as e:
+        log_msg = f"[{datetime.now().isoformat()}] ✗ Failed to upload video: {str(e)}"
+        print(log_msg)
+        return False
+
+def capture_video_async(event_id, duration, filename, filepath):
+    """Async function to handle capture and upload"""
+    try:
+        # Create test video file
+        create_test_video_file(filepath)
+        log_msg = f"[{datetime.now().isoformat()}] ✓ Video captured: {filename}"
+        print(log_msg)
+
+        # Wait a moment for file to be written
+        time.sleep(0.5)
+
+        # Upload metadata to server
+        upload_video_metadata(event_id, filename, filepath)
+
+    except Exception as e:
+        log_msg = f"[{datetime.now().isoformat()}] ✗ Capture failed: {str(e)}"
+        print(log_msg)
+
+def create_test_video_file(filepath):
+    """Create a test MP4 file (placeholder for actual video capture)"""
+    try:
+        with open(filepath, "wb") as f:
+            # Write minimal MP4 header
+            f.write(b"\x00\x00\x00\x20ftypisom")
+            f.write(b"\x00" * 8192)
+
+        # Set file size to ~50MB to simulate real video
+        os.truncate(filepath, 50 * 1024 * 1024)
+
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Error creating test video: {e}")
+
 class CameraAPIHandler(BaseHTTPRequestHandler):
     """HTTP request handler for camera API endpoints"""
 
@@ -53,6 +130,9 @@ class CameraAPIHandler(BaseHTTPRequestHandler):
             self.send_status_response()
         elif path == "/api/videos":
             self.send_video_list()
+        elif path.startswith("/videos/"):
+            # Serve video files
+            self.serve_video_file(path)
         else:
             self.send_error_response(404, "Endpoint not found")
 
@@ -64,8 +144,6 @@ class CameraAPIHandler(BaseHTTPRequestHandler):
 
         if path == "/api/capture":
             self.handle_capture_request(query_params)
-        elif path.startswith("/api/events/") and path.endswith("/video"):
-            self.handle_video_upload(path)
         else:
             self.send_error_response(404, "Endpoint not found")
 
@@ -80,13 +158,17 @@ class CameraAPIHandler(BaseHTTPRequestHandler):
                 self.send_error_response(400, "Missing event_id parameter")
                 return
 
-            # Start capturing
-            filename = video_buffer.start_capture(event_id, duration)
+            # Get filename
+            filename = f"event_{event_id}_{duration}s.mp4"
             filepath = os.path.join(VIDEO_DIR, filename)
 
-            # Simulate video capture by creating a placeholder file
-            # In production, this would trigger actual video encoding
-            self.create_test_video_file(filepath)
+            # Start async capture and upload
+            thread = threading.Thread(
+                target=capture_video_async,
+                args=(event_id, duration, filename, filepath),
+                daemon=True
+            )
+            thread.start()
 
             response = {
                 "status": "capturing",
@@ -98,55 +180,38 @@ class CameraAPIHandler(BaseHTTPRequestHandler):
             }
 
             self.send_json_response(200, response)
-
-            # Log the capture
             log_msg = f"[{datetime.now().isoformat()}] Capture started: {filename}"
             print(log_msg)
 
         except Exception as e:
             self.send_error_response(500, f"Capture failed: {str(e)}")
 
-    def handle_video_upload(self, path):
-        """Handle video metadata upload from camera to server"""
+    def serve_video_file(self, path):
+        """Serve video files from /videos/ endpoint"""
         try:
-            # Extract event_id from path: /api/events/12345/video
-            parts = path.split("/")
-            event_id = parts[3] if len(parts) > 3 else None
+            filename = path.split("/")[-1]
+            filepath = os.path.join(VIDEO_DIR, filename)
 
-            if not event_id:
-                self.send_error_response(400, "Invalid path format")
+            # Security check - prevent directory traversal
+            if not os.path.abspath(filepath).startswith(os.path.abspath(VIDEO_DIR)):
+                self.send_error_response(403, "Access denied")
                 return
 
-            # Read request body
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
-
-            if not body:
-                self.send_error_response(400, "Empty request body")
+            if not os.path.exists(filepath):
+                self.send_error_response(404, "Video not found")
                 return
 
-            metadata = json.loads(body.decode("utf-8"))
+            # Serve the file
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", os.path.getsize(filepath))
+            self.end_headers()
 
-            # Store metadata locally
-            metadata_file = os.path.join(METADATA_DIR, f"{event_id}.json")
-            with open(metadata_file, "w") as f:
-                json.dump(metadata, f, indent=2)
+            with open(filepath, "rb") as f:
+                self.wfile.write(f.read())
 
-            response = {
-                "status": "success",
-                "event_id": event_id,
-                "message": "Video metadata stored"
-            }
-
-            self.send_json_response(200, response)
-
-            log_msg = f"[{datetime.now().isoformat()}] Metadata stored: event_{event_id}.json"
-            print(log_msg)
-
-        except json.JSONDecodeError:
-            self.send_error_response(400, "Invalid JSON in request body")
         except Exception as e:
-            self.send_error_response(500, f"Upload failed: {str(e)}")
+            self.send_error_response(500, f"Error serving file: {str(e)}")
 
     def send_status_response(self):
         """Send camera status"""
@@ -155,6 +220,7 @@ class CameraAPIHandler(BaseHTTPRequestHandler):
             "model": "reCamera",
             "version": "1.0.0",
             "uptime_seconds": int(time.time()),
+            "server_url": SERVER_URL,
             "sd_card": {
                 "status": "ok",
                 "mount_point": "/tmp/sd",
@@ -206,22 +272,6 @@ class CameraAPIHandler(BaseHTTPRequestHandler):
         }
         self.send_json_response(status_code, response)
 
-    def create_test_video_file(self, filepath):
-        """Create a test MP4 file (placeholder for actual video capture)"""
-        # Create a minimal MP4 file structure
-        # In production, this would be actual video from the camera
-        try:
-            with open(filepath, "wb") as f:
-                # Write minimal MP4 header
-                f.write(b"\x00\x00\x00\x20ftypisom")  # ftyp atom
-                f.write(b"\x00" * 8192)  # Padding (placeholder for video data)
-
-            # Set file size to ~50MB to simulate real video
-            os.truncate(filepath, 50 * 1024 * 1024)
-
-        except Exception as e:
-            print(f"Error creating test video: {e}")
-
     def get_free_space_mb(self, path):
         """Get free space in MB"""
         try:
@@ -250,6 +300,8 @@ def run_server():
     print(f"[reCamera API Server] Starting on port {API_PORT}")
     print(f"[reCamera API Server] Video directory: {VIDEO_DIR}")
     print(f"[reCamera API Server] Metadata directory: {METADATA_DIR}")
+    print(f"[reCamera API Server] Server URL: {SERVER_URL}")
+    print(f"[reCamera API Server] Ready to receive capture signals from ESP32\n")
 
     try:
         server.serve_forever()
