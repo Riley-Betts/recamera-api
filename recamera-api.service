@@ -1,0 +1,17 @@
+[Unit]
+Description=reCamera API Server
+After=network.target
+StartLimitInterval=0
+
+[Service]
+Type=simple
+User=recamera
+WorkingDirectory=/tmp/sd/recamera-api
+ExecStart=/usr/bin/python3 /tmp/sd/recamera-api/camera_server.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
